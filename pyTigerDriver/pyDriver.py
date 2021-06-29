@@ -2,12 +2,16 @@
 
 
 import re
+import io
 import base64
 import json
 import logging
 import codecs
-import requests
-from .misc import quote_plus, urlencode, is_ssl, HTTPConnection, HTTPSConnection, ExceptionAuth, native_str
+import datetime
+from os import getenv
+from os.path import expanduser, isfile
+
+from .misc import quote_plus, urlencode, is_ssl, HTTPConnection, HTTPSConnection, ExceptionAuth
 
 if is_ssl:
     import ssl
@@ -22,10 +26,6 @@ class AuthenticationFailedException(Exception):
 
 
 class ExceptionCodeRet(Exception):
-    pass
-
-
-class REST_ClientError(Exception):
     pass
 
 
@@ -66,6 +66,99 @@ def _get_current_mode(line):
     return CATALOG_MODES.get(line[:-1], NULL_MODE)
 
 
+def _parse_catalog(lines):
+    vertices = []
+    edges = []
+    graphs = []
+    jobs = []
+    queries = []
+    tuples = []
+
+    current_mode = NULL_MODE
+
+    for line in lines:
+        line = line.strip()
+        if _is_mode_line(line):
+            current_mode = _get_current_mode(line)
+            continue
+
+        if line.startswith("- "):
+            line = line[2:]
+            if current_mode == VERTEX_MODE:
+                e = line.find("(")
+                vertices.append(line[7:e])
+            elif current_mode == EDGE_MODE:
+                s = line.find("EDGE ") + 5
+                e = line.find("(")
+                edges.append(line[s:e])
+            elif current_mode == GRAPH_MODE:
+                s = line.find("Graph ") + 6
+                e = line.find("(")
+                graphs.append(line[s:e])
+            elif current_mode == JOB_MODE:
+                s = line.find("JOB ") + 4
+                e = line.find(" FOR GRAPH")
+                jobs.append(line[s:e])
+            elif current_mode == QUERY_MODE:
+                e = line.find("(")
+                queries.append(line[:e])
+            elif current_mode == TUPLE_MODE:
+                e = line.find("(")
+                tuples.append(line[:e].strip())
+    return {
+        "vertices": vertices,
+        "edges": edges,
+        "graphs": graphs,
+        "jobs": jobs,
+        "queries": queries,
+        "tuples": tuples
+    }
+
+
+def _parse_secrets(lines):
+    secrets = {}
+    current = ""
+    for line in lines:
+        if line.startswith("- Secret: "):
+            current = line[len("- Secret: "):]
+            secrets[current] = {}
+        elif line.startswith("- Alias: "):
+            secrets[current]["alias"] = line[len("- Alias: "):]
+        elif line.startswith("- GraphName: "):
+            secrets[current]["graph"] = line[len("- GraphName: "):]
+        elif line.startswith("- Token: "):
+            m = TOKEN_PATTERN.match(line)
+            if m:
+                token, expire = m.groups()
+                expire_datetime = datetime.datetime.strptime(expire, "%Y-%m-%d %H:%M:%S")
+                if "tokens" not in secrets[current]:
+                    secrets[current]["tokens"] = []
+                secrets[current]["tokens"].append((token, expire_datetime))
+
+    return secrets
+
+
+def _secret_for_graph(secrets, graph):
+    for k, v in secrets.items():
+        if v["graph"] == graph:
+            return k
+
+
+def get_option(option, default=""):
+    try:
+        cfg_path = "tiger.cfg"  # expanduser
+        with open(cfg_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith(option):
+                    values = line.split()
+                    if len(values) >= 2:
+                        return values[1]
+    except:
+        pass
+    return default
+
+
 VERSION_COMMIT = {
     "2.4.0": "f6b4892ad3be8e805d49ffd05ee2bc7e7be10dff",
     "2.4.1": "47229e675f792374d4525afe6ea10898decc2e44",
@@ -76,22 +169,23 @@ VERSION_COMMIT = {
     "3.0.0": "c90ec746a7e77ef5b108554be2133dfd1e1ab1b2",
     "3.0.5": "a9f902e5c552780589a15ba458adb48984359165",
     "3.1.0": "e9d3c5d98e7229118309f6d4bbc9446bad7c4c3d",
-
+    "3.1.1": "375a182bc03b0c78b489e18a0d6af222916a48d2",
+    "3.1.2": "3887cbd1d67b58ba6f88c50a069b679e20743984",
 }
 
 
 class GSQL_Client(object):
 
-    def __init__(self, server_ip="127.0.0.1", username="tigergraph", password="tigergraph", local=False, cacert="",
-                 version="", protocol="https", gsPort="14240", commit="", graph="", token=""):
-        self.request_session = requests.Session()
+    def __init__(self, server_ip="127.0.0.1", username="tigergraph", password="tigergraph", cacert="",
+                 version="", commit="", gsPort="14240", restpp="9000", debug=False):
+        self.debug = debug
         self._logger = logging.getLogger("gsql_client.Client")
         self._server_ip = server_ip
-        self.username = username
-        self.password = password
-        self.graph = graph
-        self.gsPort = gsPort
-        self.token = token
+        self._username = username
+        self._password = password
+        if self.debug:
+            print(password)
+            print(username)
         if commit:
             self._client_commit = commit
         elif version in VERSION_COMMIT:
@@ -106,49 +200,35 @@ class GSQL_Client(object):
         else:
             self._abort_name = "abortloadingprogress"
 
-        self.protocol = protocol
-        if self.protocol == "https":
+        if cacert and is_ssl:
             self._context = ssl.SSLContext(ssl.PROTOCOL_SSLv23)
             self._context.check_hostname = False
             self._context.verify_mode = ssl.CERT_REQUIRED
-            if cacert:
-                self._context.load_verify_locations(cacert)
-            else:
-                pass
-                # Todo : Get CACERT from url provided
+            self._context.load_verify_locations(cacert)
+            self._protocol = "https"
         else:
             self._context = None
+            self._protocol = "http"
+
         self.base64_credential = base64.b64encode(
-            "{0}:{1}".format(self.username, self.password).encode("utf-8")).decode("utf-8")
+            "{0}:{1}".format(self._username, self._password).encode("utf-8")).decode("utf-8")
 
-        self.is_local = local
+        self._base_url = "/gsqlserver/gsql/"  #
+        if ":" not in server_ip:
+            self._server_ip = "{0}:{1}".format(server_ip, gsPort)
+        if self.debug:
+            print(self._server_ip)
+            print(self._username)
 
-        if self.is_local:
-            self._base_url = "/gsql/"
-            if ":" not in server_ip:
-                port = self.gsPort
-                self._server_ip = "{0}:{1}".format(server_ip, port)
-        else:
-            self._base_url = "/gsqlserver/gsql/"  #
-            if ":" not in server_ip:
-                self._server_ip = "{0}:{1}".format(server_ip, self.gsPort)
+        self._initialize_url()
 
-        self.initialize_url()
-
+        self.graph = ""
         self.session = ""
         self.properties = ""
-        if self.protocol == "https":
-            self.gsqlUrl = "https://" + self._server_ip + self._base_url
 
-        else:
-            self.gsqlUrl = "http://" + self._server_ip + self._base_url
-        self.cookie = {}
         self.authorization = 'Basic {0}'.format(self.base64_credential)
 
-    def setGraph(self, graph):
-        self.graph = graph
-
-    def initialize_url(self):
+    def _initialize_url(self):
         self.command_url = self._base_url + "command"
         self.version_url = self._base_url + "version"
         self.help_url = self._base_url + "help"
@@ -156,21 +236,21 @@ class GSQL_Client(object):
         self.reset_url = self._base_url + "reset"
         self.file_url = self._base_url + "file"
         self.dialog_url = self._base_url + "dialog"
-        self.conn = None
+
         self.info_url = self._base_url + "getinfo"
         self.abort_url = self._base_url + self._abort_name
 
-    def get_cookie(self):
+    def _get_cookie(self):
 
         cookie = {}
+        cookie["fromGsqlClient"] = True
+        cookie["fromGraphStudio"] = True
 
         if self.graph:
             cookie["graph"] = self.graph
-        cookie["fromGsqlClient"] = True
-        if self.session:
-            cookie["sessionId"] = self.session
 
-        cookie["serverId"] = "1_1613327897156"
+        if self.session:
+            cookie["session"] = self.session
 
         if self.properties:
             cookie["properties"] = self.properties
@@ -180,61 +260,56 @@ class GSQL_Client(object):
 
         return json.dumps(cookie, ensure_ascii=True)
 
-    def set_cookie(self, cookie_str):
+    def _set_cookie(self, cookie_str):
 
         cookie = json.loads(cookie_str)
-        self.session = cookie.get("sessionId", "")
+        self.session = cookie.get("session", "")
         self.graph = cookie.get("graph", "")
         self.properties = cookie.get("properties", "")
 
-    def setToken(self, token):
-        self.token = token
+    def _setup_connection(self, url, content, cookie={}, auth=True):
 
-    def _setup_connection(self, url, content, cookie=None, auth=True):
+        if cookie == None:
+            cookie = {}
 
-        if self.protocol == "https":
+        cookie["fromGsqlClient"] = True
+        cookie["fromGraphStudio"] = True
+        if self._protocol == "https":
             ssl._create_default_https_context = ssl._create_unverified_context
             conn = HTTPSConnection(self._server_ip)
         else:
             conn = HTTPConnection(self._server_ip)
         encoded = quote_plus(content.encode("utf-8"))
-        cookie_value = self.get_cookie() if cookie is None else cookie
         headers = {
             "Content-Language": "en-US",
-            "Content-Length": str(len(encoded)),
             "Pragma": "no-cache",
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
             "Content-Type": "application/x-www-form-urlencoded",
             "User-Agent": "Java/1.8.0",
-            "Cookie": cookie_value
+            "Cookie": json.dumps(self._get_cookie()) if cookie is None else json.dumps(cookie)
         }
 
         if auth:
             headers["Authorization"] = self.authorization
+            conn.request("POST", url, encoded, headers)
+        else:
+            conn.request("POST", url, self.base64_credential, headers)
+        return conn
 
-        URI = self.protocol+"://"+self._server_ip+url
-
-        res = self.request_session.post(URI,headers=headers,data=encoded)
-        # conn.request("POST", url, encoded, headers)
-
-        return res
-    def request(self, url, content, handler=None, cookie=None, auth=True):
+    def _request(self, url, content, handler=None, cookie=None, auth=True):
         response = None
         try:
             r = self._setup_connection(url, content, cookie, auth)
-            # response = r.getresponse()
-            response = r
-            # ret_code = response.status
-            ret_code = r.status_code
+            response = r.getresponse()
+            ret_code = response.status
             if ret_code == 401:
                 raise AuthenticationFailedException("Invalid Username/Password!")
             if handler:
-                # reader = codecs.getreader("utf-8")(r.content)
-                reader = r.text.split("\n")
+                reader = codecs.getreader("utf-8")(response)
                 return handler(reader)
             else:
-                return response.content.decode("utf-8")
+                return response.read().decode("utf-8")
         finally:
             if response:
                 response.close()
@@ -243,7 +318,7 @@ class GSQL_Client(object):
 
         self._request(self.dialog_url, response)
 
-    def command_interactive(self, url, content, ans="", out=False):
+    def _command_interactive(self, url, content, ans="", out=False):
 
         def __handle__interactive(reader):
 
@@ -251,9 +326,6 @@ class GSQL_Client(object):
             for line in reader:
                 line = line.strip()
                 if line.startswith(PREFIX_RET):
-                    # ! print(line)
-                    import time
-                    time.sleep(5000)
                     _, ret = line.split(",", 1)
                     ret = int(ret)
                     if ret != 0:
@@ -265,8 +337,7 @@ class GSQL_Client(object):
                         self._dialog("{0},{1}".format(ik, ans))
                 elif line.startswith(PREFIX_COOKIE):
                     _, cookie_s = line.split(",", 1)
-                    self.set_cookie(cookie_s)
-                    # print(cookie_s)
+                    self._set_cookie(cookie_s)
                 elif line.startswith(PREFIX_CURSOR_UP):
                     values = line.split(",")
                     print("\033[" + values[1] + "A")
@@ -282,22 +353,38 @@ class GSQL_Client(object):
                     res.append(line)
             return res
 
-        return self.request(url, content, __handle__interactive)
+        return self._request(url, content, __handle__interactive)
 
     def login(self, commit_try="", version_try=""):
 
         if self._client_commit == "" and commit_try == "":
+            # print('\033[33m' + "======= NO Version defined ============")
+
             for k in VERSION_COMMIT:
+                # print( '\033[33m' + "==== Trying Version : {}".format(k))
+
                 if (self.login(version_try=k, commit_try=VERSION_COMMIT[k]) == True):
+                    # print('\x1b[6;30;42m' + "Succeded ! your version is {}".format(k) + '\x1b[0m')
+
                     break
+                else:
+                    CRED = '\033[91m'
+                    CEND = '\033[0m'
+                    # print(CRED + "Failed to connect version <> {}".format(k) + CEND)
+
+                # import time
+                # time.sleep(2)
         elif commit_try != "":
             self._client_commit = commit_try
             self._version = version_try
         response = None
+
         try:
             Cookies = {}
             Cookies['clientCommit'] = self._client_commit
-            r = self._setup_connection(self.login_url, self.base64_credential, cookie=json.dumps(Cookies), auth=False)
+            if self.debug:
+                print(self.base64_credential)
+            r = self._setup_connection(self.login_url, self.base64_credential, cookie=Cookies, auth=False)
             response = r.getresponse()
             ret_code = response.status
             # print(response.status)
@@ -316,6 +403,7 @@ class GSQL_Client(object):
                     return False
 
                 if res.get("error", False):
+                    print(res)
                     if "Wrong password!" in res.get("message", ""):
                         raise ExceptionAuth("Invalid Username/Password!")
                     else:
@@ -327,180 +415,261 @@ class GSQL_Client(object):
             if response:
                 response.close()
 
-    def _setup_connectionpp(self, method, endpoint, parameters, content,headers):
-        url = native_str(endpoint)
-        if parameters:
-            param_str = native_str(urlencode(parameters))
-            if param_str:  # not None nor Empty
-                url += "?" + param_str
+    def get_auto_keys(self):
 
-        _headers = {
-            "Content-Language": "en-US",
-            "Pragma": "no-cache",
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "Content-Type": "application/json"
-        }
-        if headers:
-            _headers.update(headers)
-        if content:
-            encoded = content.encode("utf-8")
-            _headers["Content-Length"] = str(len(encoded))
+        keys = self._request(self.info_url, "autokeys", cookie=self.session)
+        return keys.split(",")
+
+    def quit(self):
+
+        self._request(self.abort_url, self._abort_name)
+
+    def run_file(self, path):
+        content = self._load_file_recursively(path)
+        return self._command_interactive(self.file_url, content)
+
+    def run_multiple(self, lines):
+        return self._command_interactive(self.file_url, "\n".join(lines))
+
+    def version(self):
+        return self._command_interactive(self.version_url, "version")
+
+    def help(self):
+        return self._command_interactive(self.help_url, "help")
+
+    def query(self, content, ans=""):
+
+        return self._command_interactive(self.command_url, content, ans)
+
+    def use(self, graph):
+
+        return self._command_interactive(self.command_url, "use graph {0}".format(graph))
+
+    def catalog(self):
+
+        lines = self._command_interactive(self.command_url, "ls", out=False)
+        return _parse_catalog(lines)
+
+    def get_secrets(self, graph_name):
+        if self.graph != graph_name:
+            self.use(graph_name)
+        lines = self.query("show secret")
+        return _parse_secrets(lines)
+
+    def get_secret(self, graph_name, create_alias=None):
+        secrets = self.get_secrets(graph_name)
+        s = _secret_for_graph(secrets, graph_name)
+        if s:
+            return s
+        elif create_alias:
+            lines = self.query("create secret {0}".format(create_alias))
+            return lines[0].split()[2]
+
+    def _load_file_recursively(self, file_path):
+        return self._read_file(file_path, set())
+
+    def _read_file(self, file_path, loaded):
+        if not file_path or not isfile(file_path):
+            self._logger.warn("File \"" + file_path + "\" does not exist!")
+            return ""
+
+        if file_path in loaded:
+            self._logger.error("There is an endless loop by using @" + file_path + " cmd recursively.")
+            raise ExceptionRecursiveRet(file_path)
         else:
-            encoded = None
+            loaded.add(file_path)
 
-        if self.token:
-            _headers["Authorization"] = "Bearer {0}".format(self.token)
-        elif self.username and self.password:
-            _headers["Authorization"] = 'Basic {0}'.format(self.base64_credential)
+        res = ""
+        with io.open(file_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if FILE_PATTERN.match(line):
+                    res += self._read_file(line[1:], loaded) + "\n"
+                    continue
+                res += line + "\n"
+        return res
 
-        if self.protocol == "https":
-            ssl._create_default_https_context = ssl._create_unverified_context
-            conn = HTTPSConnection(self._server_ip)
-        else:
-            conn = HTTPConnection(self._server_ip)
-        conn.request(method, url, encoded, _headers)
-        return conn
 
-    def _errorCheck(self, res):
-        if "error" in res and res["error"] and res["error"] != "false":
-            raise Exception(res["message"], (res["code"] if "code" in res else None))
-
-    def requestpp(self, method, endpoint, parameters=None, content=None,headers=None, resKey="", skipCheck=False):
-        response = None
-        try:
-            r = self._setup_connectionpp(method, endpoint, parameters, content, headers)
-            response = r.getresponse()
-            ret_code = response.status
-            if ret_code == 401:
-                raise ExceptionAuth("Invalid token!")
-            response_text = response.read().decode("utf-8")
-            self._logger.debug(response_text)
-            res = json.loads(response_text, strict=False)
-            if not skipCheck:
-                self._errorCheck(res)
-
-            if resKey != "":
-                return res[resKey]
-            return res
-
-        finally:
-            if response:
-                response.close()
-
-    def get(self, endpoint, parameters=None,headers=None, resKey="", skipCheck=False):
-        return self.requestpp("GET", self.gsqlUrl + endpoint, parameters, None, headers, resKey, skipCheck)
-
-    def post(self, endpoint, parameters=None, content=None,headers=None, resKey="", skipCheck=False):
-        return self.requestpp("POST", self.gsqlUrl + endpoint, parameters, content, headers, resKey, skipCheck)
-
-    def delete(self, endpoint, parameters=None):
-        return self.requestpp("DELETE", self.gsqlUrl + endpoint, parameters, None)
-
-    def execute(self, content, ans="", out=False):
-        return self.command_interactive(self.command_url, content, ans, out)
+class REST_ClientError(Exception):
+    pass
 
 
 class REST_Client(object):
-    def __init__(self, server_ip, protocol, cacert, token, username \
-                 , restPort, password):
-        self.token = token
-        self.restPort = restPort
-        self.username = username
-        self.password = password
-        self.base64_credential = base64.b64encode(
-            "{0}:{1}".format(self.username, self.password).encode("utf-8")).decode("utf-8")
-        self.protocol = protocol
-        if self.protocol == "https":
-            self._context = ssl.SSLContext(ssl.PROTOCOL_SSLv23)
-            self._context.check_hostname = False
-            self._context.verify_mode = ssl.CERT_REQUIRED
-            self._context.load_verify_locations(cacert)
-        else:
-            self._context = None
-        server_ip = native_str(server_ip)
 
+    def __init__(self, server_ip):
+
+        self._token = ""
         if ":" in server_ip:
             self._server_ip = server_ip
         else:
-            self._server_ip = server_ip + ":" + self.restPort
+            self._server_ip = server_ip + ":9000"
 
-        self._logger = logging.getLogger("gsql_client.restpp.RESTPP")
+        self._logger = logging.getLogger("gsql_client.RESTPP")
 
-    def _setup_connection(self, method, endpoint, parameters, content, headers):
-        url = native_str(endpoint)
+    def _setup_connection(self, method, endpoint, parameters, content):
+
+        url = endpoint
         if parameters:
-            param_str = native_str(urlencode(parameters))
-            if param_str:  # not None nor Empty
-                url += "?" + param_str
+            url += "?" + urlencode(parameters)
 
-        _headers = {
+        headers = {
             "Content-Language": "en-US",
             "Pragma": "no-cache",
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
             "Content-Type": "application/json"
         }
-        if headers:
-            _headers.update(headers)
+
         if content:
             encoded = content.encode("utf-8")
-            _headers["Content-Length"] = str(len(encoded))
+            headers["Content-Length"] = str(len(encoded))
         else:
             encoded = None
 
-        if self.token:
-            _headers["Authorization"] = "Bearer {0}".format(self.token)
-        elif self.username and self.password:
-            _headers["Authorization"] = 'Basic {0}'.format(self.base64_credential)
+        if self._token:
+            headers["Authorization"] = "Bearer: {0}".format(self._token)
 
-        if self.protocol == "https":
-            ssl._create_default_https_context = ssl._create_unverified_context
-            conn = HTTPSConnection(self._server_ip)
-        else:
-            conn = HTTPConnection(self._server_ip)
-        conn.request(method, url, encoded, _headers)
+        conn = HTTPConnection(self._server_ip)
+        conn.request(method, url, encoded, headers)
         return conn
 
-    def _errorCheck(self, res):
-        if "error" in res and res["error"] and res["error"] != "false":
-            raise Exception(res["message"], (res["code"] if "code" in res else None))
+    def _request(self, method, endpoint, parameters=None, content=None):
 
-    def request(self, method, endpoint, parameters=None, content=None,  headers=None, resKey="", skipCheck=False):
         response = None
         try:
-            r = self._setup_connection(method, endpoint, parameters, content, headers)
+            r = self._setup_connection(method, endpoint, parameters, content)
             response = r.getresponse()
             ret_code = response.status
             if ret_code == 401:
-                raise ExceptionAuth("Invalid token!")
+                raise AuthenticationFailedException("Invalid token!")
             response_text = response.read().decode("utf-8")
             self._logger.debug(response_text)
+            # non strict mode to allow control characters in string
             res = json.loads(response_text, strict=False)
 
-            if not skipCheck:
-                self._errorCheck(res)
-
-            if resKey != '':
-                return res[resKey]
-
-            return res
+            # notice that result is not consistent, we need to handle them differently
+            if "error" not in res:
+                return res
+            elif res["error"] and res["error"] != "false":  # workaround for GET /version result
+                self._logger.error("API error: " + res["message"])
+                raise REST_ClientError(res.get("message", ""))
+            elif "token" in res:
+                return res["token"]
+            elif "results" in res:
+                return res["results"]
+            elif "message" in res:
+                return res["message"]
+            else:
+                return res
         finally:
             if response:
                 response.close()
 
-    def setToken(self, token):
-        self.token = token
+    def _get(self, endpoint, parameters=None):
+        return self._request("GET", endpoint, parameters, None)
 
-    #def get(self, path, headers=None, resKey="results", skipCheck=False, params=None):
-    def get(self, endpoint, parameters=None, headers=None, resKey="", skipCheck=False):
-        return self.request("GET", endpoint, parameters, None, headers, resKey, skipCheck)
+    def _post(self, endpoint, parameters=None, content=None):
+        return self._request("POST", endpoint, parameters, content)
 
-    def post(self, endpoint, parameters=None, content=None, headers=None, resKey="", skipCheck=False):
-        return self.request("POST", endpoint, parameters, content, headers, resKey, skipCheck)
+    def _delete(self, endpoint, parameters=None):
+        return self._request("DELETE", endpoint, parameters, None)
 
-    def delete(self, endpoint, parameters=None):
-        return self.request("DELETE", endpoint, parameters, None)
+    def request_token(self, secret, lifetime=None):
+
+        parameters = {
+            "secret": secret
+        }
+        if lifetime:
+            parameters["lifetime"] = lifetime
+
+        res = self._get("/requesttoken", parameters)
+        if res:
+            self._token = res
+            return True
+        else:
+            return False
 
     def echo(self):
-        return self.get("/echo")
+
+        return self._get("/echo")
+
+    def version(self):
+
+        return self._get("/version")
+
+    def endpoints(self):
+
+        return self._get("/endpoints")
+
+    def license(self):
+
+        return self._get("/showlicenseinfo")
+
+    def stat(self, graph, **kwargs):
+
+        url = "/builtins/" + graph
+        return self._post(url, content=json.dumps(kwargs, ensure_ascii=True))
+
+    def stat_vertex_number(self, graph, type_name="*"):
+        return self.stat(graph, function="stat_vertex_number", type=type_name)
+
+    def stat_edge_number(self, graph, type_name="*", from_type_name="*", to_type_name="*"):
+        return self.stat(graph, function="stat_edge_number", type=type_name,
+                         from_type=from_type_name, to_type=to_type_name)
+
+    def stat_vertex_attr(self, graph, type_name="*"):
+        return self.stat(graph, function="stat_vertex_attr", type=type_name)
+
+    def stat_edge_attr(self, graph, type_name="*", from_type_name="*", to_type_name="*"):
+        return self.stat(graph, function="stat_edge_attr", type=type_name,
+                         from_type=from_type_name, to_type=to_type_name)
+
+    def select_vertices(self, graph, vertex_type, vertex_id=None, **kwargs):
+
+        endpoint = "/graph/{0}/vertices/{1}".format(graph, vertex_type)
+        if vertex_id:
+            endpoint += "/" + vertex_id
+        return self._get(endpoint, kwargs)
+
+    def select_edges(self, graph, src_type, src_id, edge_type="_", dst_type=None, dst_id=None, **kwargs):
+
+        endpoint = "/graph/{0}/edges/{1}/{2}/{3}".format(graph, src_type, src_id, edge_type)
+        if dst_type:
+            endpoint += "/" + dst_type
+            if dst_id:
+                endpoint += "/" + dst_id
+        return self._get(endpoint, kwargs)
+
+    def delete_vertices(self, graph, vertex_type, vertex_id=None, **kwargs):
+
+        endpoint = "/graph/{0}/vertices/{1}".format(graph, vertex_type)
+        if vertex_id:
+            endpoint += "/" + vertex_id
+        return self._get(endpoint, kwargs)
+
+    def delete_edges(self, graph, src_type, src_id, edge_type="_", dst_type=None, dst_id=None, **kwargs):
+
+        endpoint = "/graph/{0}/edges/{1}/{2}/{3}".format(graph, src_type, src_id, edge_type)
+        if dst_type:
+            endpoint += "/" + dst_type
+            if dst_id:
+                endpoint += "/" + dst_id
+        return self._delete(endpoint, kwargs)
+
+    def load(self, graph, lines, **kwargs):
+
+        if lines:
+            content = "\n".join(lines)
+        else:
+            content = None
+
+        endpoint = "/ddl/" + graph
+        return self._post(endpoint, kwargs, content)
+
+    def update(self, graph, content):
+
+        return self._post("/graph/" + graph, content=json.dumps(content, ensure_ascii=True))
+
+    def query(self, graph, query_name, **kwargs):
+
+        return self._get("/{0}/{1}".format(graph, query_name), kwargs)
