@@ -5,7 +5,7 @@ with open("README.md", "r") as rdm:
 
 setuptools.setup(
     name="pyTigerDriver",
-    version="v1.0.13",
+    version="v1.0.14",
     author="Zrouga Mohamed",
     author_email="medzrouga@gmail.com",
     description="GSQL client for TigerGraph",
