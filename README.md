@@ -1,7 +1,9 @@
 
 # pyTigerDriver 
 
+We **highly** recommend you use [pyTigerGraph](https://github.com/tigergraph/pyTigerGraph) to interact with your TigerGraph database. pyTigerDriver is a dependency of pyTigerGraph.
 
+If you are using pyTigerGraph, ignore the following documentation.
 
 ## Installation
 
